@@ -8,8 +8,11 @@
 
 Geofabrik draws each map's area a little past the border, so neighbours
 overlap in a strip about a kilometre wide and the roads there are in both
-maps. A crossing is the point of a road in that strip furthest from the
-strip's two edges, so it is well inside both maps.
+maps (each extract also keeps every road that leaves it whole, to its end).
+A road crosses when, through the strip, it joins this map's side to the
+neighbour's side; roads that only run along inside the strip do not count.
+The crossing point is where the road is furthest from both edges of the
+strip, so it is well inside both maps.
 
   borders.py <id> <extract.osm.pbf>
 
@@ -21,7 +24,7 @@ import sys
 
 import osmium
 import shapely
-from shapely.geometry import LineString, Point, box, shape
+from shapely.geometry import LineString, box, shape
 
 # Road classes, in the order the app ranks them.
 CLASSES = {
@@ -38,7 +41,7 @@ CLASSES = {
     "footway": 10, "pedestrian": 10, "steps": 10,
 }
 CELL = 0.01  # degrees, for finding the road pieces near a strip quickly
-SAME_SPOT = 100  # metres: crossings closer than this are one crossing
+SAME_SPOT = 100  # metres: crossings of one class closer than this are one
 
 
 def metres(a, b):
@@ -46,11 +49,32 @@ def metres(a, b):
     return math.hypot((a[0] - b[0]) * k, a[1] - b[1]) * 111_320
 
 
+class Joins:
+    """Which road nodes the strip's pieces of road join up."""
+
+    def __init__(self):
+        self.up = {}
+
+    def find(self, x):
+        root = x
+        while self.up.get(root, root) != root:
+            root = self.up[root]
+        while self.up.get(x, x) != root:
+            self.up[x], x = root, self.up[x]
+        return root
+
+    def join(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.up[ra] = rb
+
+
 def main():
     map_id, pbf = sys.argv[1], sys.argv[2]
     rows = {r["id"]: r for r in json.load(open("build-list.json"))}
     outlines = json.load(open("outlines.json"))
     area = shapely.make_valid(shape(outlines[map_id]))
+    shapely.prepare(area)
     edge = area.boundary
 
     strips = {}
@@ -58,19 +82,26 @@ def main():
         o = shapely.make_valid(shape(outlines[other]))
         s = area.intersection(o)
         if s.area > 0:
-            strips[other] = (s, o.boundary)
             shapely.prepare(s)
+            shapely.prepare(o)
+            strips[other] = {"strip": s, "area": o, "edge": o.boundary, "joins": Joins(), "sides": {}, "pieces": []}
 
     # The grid cells each strip touches.
     cells = {}
-    for other, (s, _) in strips.items():
+    for other, st in strips.items():
+        s = st["strip"]
         x0, y0, x1, y1 = s.bounds
         for cx in range(math.floor(x0 / CELL), math.floor(x1 / CELL) + 1):
             for cy in range(math.floor(y0 / CELL), math.floor(y1 / CELL) + 1):
                 if s.intersects(box(cx * CELL, cy * CELL, (cx + 1) * CELL, (cy + 1) * CELL)):
                     cells.setdefault((cx, cy), set()).add(other)
 
-    best = {}  # (way id, neighbour) -> (score, lon, lat, class)
+    def side(st, p):
+        """"a" on this map's side of the strip, "b" on the neighbour's."""
+        in_a = shapely.contains_xy(area, p[0], p[1])
+        in_b = shapely.contains_xy(st["area"], p[0], p[1])
+        return "a" if in_a and not in_b else "b" if in_b and not in_a else ""
+
     fp = osmium.FileProcessor(pbf).with_locations().with_filter(osmium.filter.KeyFilter("highway"))
     for way in fp:
         if not way.is_way():
@@ -78,8 +109,8 @@ def main():
         cls = CLASSES.get(way.tags.get("highway"))
         if cls is None:
             continue
-        pts = [(n.lon, n.lat) for n in way.nodes if n.location.valid()]
-        for a, b in zip(pts, pts[1:]):
+        nodes = [(n.ref, (n.lon, n.lat)) for n in way.nodes if n.location.valid()]
+        for (ida, a), (idb, b) in zip(nodes, nodes[1:]):
             near = set()
             for cx in range(math.floor(min(a[0], b[0]) / CELL), math.floor(max(a[0], b[0]) / CELL) + 1):
                 for cy in range(math.floor(min(a[1], b[1]) / CELL), math.floor(max(a[1], b[1]) / CELL) + 1):
@@ -88,29 +119,41 @@ def main():
                 continue
             seg = LineString([a, b])
             for other in near:
-                s, other_edge = strips[other]
-                piece = seg.intersection(s)
+                st = strips[other]
+                piece = seg.intersection(st["strip"])
                 if piece.is_empty or piece.length == 0:
                     continue
+                st["joins"].join(ida, idb)
+                for nid, p in ((ida, a), (idb, b)):
+                    s = side(st, p)
+                    if s:
+                        st["sides"].setdefault(nid, set()).add(s)
                 p = piece.interpolate(0.5, normalized=True) if piece.geom_type == "LineString" else piece.centroid
-                score = min(p.distance(edge), p.distance(other_edge))
-                key = (way.id, other)
-                if key not in best or score > best[key][0]:
-                    best[key] = (score, p.x, p.y, cls)
+                score = min(p.distance(edge), p.distance(st["edge"]))
+                st["pieces"].append((ida, cls, score, p.x, p.y))
 
-    crossings = {}
-    for (_, other), (score, x, y, cls) in best.items():
-        crossings.setdefault(other, []).append((cls, -score, x, y))
     out = {}
-    for other, pts in crossings.items():
-        # Bigger roads first, so where two crossings are one, the bigger road
-        # is the one kept.
-        pts.sort()
+    for other, st in strips.items():
+        joins = st["joins"]
+        reach = {}
+        for nid, sides in st["sides"].items():
+            reach.setdefault(joins.find(nid), set()).update(sides)
+        # Per stretch of joined-up road that runs from one side to the other,
+        # the best point of each road class on it.
+        best = {}
+        for nid, cls, score, x, y in st["pieces"]:
+            group = joins.find(nid)
+            if reach.get(group, set()) != {"a", "b"}:
+                continue
+            if (group, cls) not in best or score > best[(group, cls)][0]:
+                best[(group, cls)] = (score, x, y)
+        pts = sorted((cls, -score, x, y) for (_, cls), (score, x, y) in best.items())
         kept = []
         for cls, _, x, y in pts:
             if all(metres((x, y), (k[0], k[1])) > SAME_SPOT for k in kept if k[2] == cls):
                 kept.append((round(x, 5), round(y, 5), cls))
-        out[other] = kept
+        if kept:
+            out[other] = kept
 
     simple = area.simplify(0.002, preserve_topology=True)
     outline = shapely.geometry.mapping(shapely.set_precision(simple, 1e-5))

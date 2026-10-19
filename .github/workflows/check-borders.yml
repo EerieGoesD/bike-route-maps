@@ -1,0 +1,28 @@
+# Checks published border files: each crossing between two maps must be
+# reachable in both (scripts/check-borders.py). Pairs as "a:b,c:d".
+name: Check borders
+
+on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: 'Map pairs, "portugal:spain-galicia,andorra:spain-cataluna"'
+        required: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -m venv /tmp/venv && /tmp/venv/bin/pip install --quiet shapely
+          sudo mkdir -p /mnt/work && sudo chown "$USER" /mnt/work
+          for pair in $(echo "${{ inputs.pairs }}" | tr ',' ' '); do
+            a="${pair%%:*}"; b="${pair##*:}"
+            for f in "$a.tar" "$b.tar" "$a.borders.json"; do
+              [ -f "/mnt/work/$f" ] || gh release download maps -p "$f" -D /mnt/work -R "$GITHUB_REPOSITORY"
+            done
+            /tmp/venv/bin/python scripts/check-borders.py "$a" "$b" /mnt/work
+          done
