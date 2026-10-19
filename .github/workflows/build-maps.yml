@@ -1,5 +1,7 @@
 # Builds routing maps from OpenStreetMap and publishes them in the "maps"
-# release, with regions.json, the list the app reads.
+# release: <id>.tar, the map; <id>.borders.json, its area and the points where
+# its roads cross into the maps next to it; and regions.json, the list the app
+# reads.
 #
 # Run it from the Actions tab with the maps to build: ids from
 # build-list.json ("portugal,andorra"), or "1/2" and then "2/2" for all of
@@ -12,6 +14,10 @@ on:
       maps:
         description: 'Map ids, comma separated, or "N/M" for a share of all of them'
         required: true
+      borders_only:
+        description: "Only the border files, for maps already built"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -45,10 +51,12 @@ jobs:
           sudo mkdir -p /mnt/work && sudo chown "$USER" /mnt/work
           curl -fsSL --retry 5 -o "/mnt/work/${{ matrix.map.id }}.osm.pbf" "${{ matrix.map.pbf }}"
       - name: Build
+        if: ${{ !inputs.borders_only }}
         run: |
           docker run --rm -v /mnt/work:/work -v "$PWD/scripts:/scripts:ro" \
             ghcr.io/valhalla/valhalla:3.9.1 bash /scripts/build-region.sh "${{ matrix.map.id }}"
       - name: Upload
+        if: ${{ !inputs.borders_only }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -57,6 +65,14 @@ jobs:
           echo "$bytes bytes"
           # GitHub takes files under 2 GiB.
           [ "$bytes" -lt 2147483648 ] || { echo "Too big for one file: split this map in build-list.json"; exit 1; }
+          gh release upload maps "$f" --clobber -R "$GITHUB_REPOSITORY"
+      - name: Borders
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -m venv /tmp/venv && /tmp/venv/bin/pip install --quiet osmium shapely
+          f="/mnt/work/${{ matrix.map.id }}.borders.json"
+          /tmp/venv/bin/python scripts/borders.py "${{ matrix.map.id }}" "/mnt/work/${{ matrix.map.id }}.osm.pbf" > "$f"
           gh release upload maps "$f" --clobber -R "$GITHUB_REPOSITORY"
 
   publish:
