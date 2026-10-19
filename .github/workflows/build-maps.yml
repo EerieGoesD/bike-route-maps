@@ -1,0 +1,73 @@
+# Builds routing maps from OpenStreetMap and publishes them in the "maps"
+# release, with regions.json, the list the app reads.
+#
+# Run it from the Actions tab with the maps to build: ids from
+# build-list.json ("portugal,andorra"), or "1/2" and then "2/2" for all of
+# them (a run builds at most 256).
+name: Build maps
+
+on:
+  workflow_dispatch:
+    inputs:
+      maps:
+        description: 'Map ids, comma separated, or "N/M" for a share of all of them'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: pick
+        run: python3 scripts/pick.py "${{ inputs.maps }}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      # Gentle on Geofabrik, which serves the extracts for free.
+      max-parallel: 12
+      matrix:
+        map: ${{ fromJson(needs.plan.outputs.matrix) }}
+    name: ${{ matrix.map.id }}
+    steps:
+      - uses: actions/checkout@v4
+      # The runner's big second disk.
+      - name: Download
+        run: |
+          sudo mkdir -p /mnt/work && sudo chown "$USER" /mnt/work
+          curl -fsSL --retry 5 -o "/mnt/work/${{ matrix.map.id }}.osm.pbf" "${{ matrix.map.pbf }}"
+      - name: Build
+        run: |
+          docker run --rm -v /mnt/work:/work -v "$PWD/scripts:/scripts:ro" \
+            ghcr.io/valhalla/valhalla:3.9.1 bash /scripts/build-region.sh "${{ matrix.map.id }}"
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          f="/mnt/work/${{ matrix.map.id }}.tar"
+          bytes=$(stat -c %s "$f")
+          echo "$bytes bytes"
+          # GitHub takes files under 2 GiB.
+          [ "$bytes" -lt 2147483648 ] || { echo "Too big for one file: split this map in build-list.json"; exit 1; }
+          gh release upload maps "$f" --clobber -R "$GITHUB_REPOSITORY"
+
+  publish:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    concurrency: publish
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/publish.py "$GITHUB_REPOSITORY" > regions.json
+          gh release upload maps regions.json --clobber -R "$GITHUB_REPOSITORY"
