@@ -22,7 +22,10 @@ print(f"{a} -> {b}: {len(crossings)} crossings")
 
 
 def inside(area, other):
-    p = area.difference(other).representative_point()
+    """A point on this side, some way in from the border."""
+    near = area.difference(other).intersection(area.intersection(other).buffer(0.3))
+    parts = getattr(near, "geoms", [near])
+    p = max(parts, key=lambda g: g.area).representative_point()
     return {"lat": p.y, "lon": p.x}
 
 
@@ -43,8 +46,11 @@ def times(map_id, target):
     out = subprocess.run(
         ["docker", "run", "--rm", "-v", f"{work}:/work", "ghcr.io/valhalla/valhalla:3.9.1",
          "valhalla_service", f"/work/{map_id}.config.json", "sources_to_targets", json.dumps(req)],
-        capture_output=True, text=True, check=True,
-    ).stdout
+        capture_output=True, text=True,
+    )
+    if out.returncode:
+        sys.exit(out.stderr[-2000:])
+    out = out.stdout
     rows = json.loads(out[out.index("{"):])["sources_to_targets"]
     return [r[0]["time"] for r in rows]
 
