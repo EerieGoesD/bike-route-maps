@@ -2,7 +2,7 @@
 """Writes regions.json, the list of maps the app offers, from what is in the
 "maps" release right now: every <id>.tar there, with its size and checksum
 as GitHub reports them, its border file when there is one, and its name,
-area and neighbours from build-list.json. Built again from scratch each
+box, rough outline and neighbours from build-list.json. Built again from scratch each
 time, so runs that finish together cannot undo each other."""
 
 import json
@@ -41,9 +41,10 @@ for a in assets:
             "built": a["updated_at"][:10],
             "borders": borders.get(rid),
             "neighbours": row.get("neighbours", []),
+            "area": row.get("area"),
         }
     )
 regions.sort(key=lambda r: r["name"])
-json.dump({"regions": regions}, sys.stdout, ensure_ascii=False, indent=2)
+json.dump({"regions": regions}, sys.stdout, ensure_ascii=False, separators=(",", ":"))
 print()
 print(f"{len(regions)} maps", file=sys.stderr)

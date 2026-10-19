@@ -14,6 +14,7 @@ import json
 import math
 import re
 import sys
+import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -33,28 +34,32 @@ SKIP = {
 
 
 def size(url):
-    req = urllib.request.Request(url, method="HEAD")
-    with urllib.request.urlopen(req) as res:
-        return int(res.headers["Content-Length"])
+    for attempt in range(5):
+        try:
+            req = urllib.request.Request(url, method="HEAD")
+            with urllib.request.urlopen(req, timeout=60) as res:
+                return int(res.headers["Content-Length"])
+        except OSError:
+            if attempt == 4:
+                raise
+            time.sleep(5 * (attempt + 1))
 
 
 def bbox(geometry):
-    xs, ys = [], []
-
-    def walk(c):
-        if isinstance(c[0], (int, float)):
-            xs.append(c[0])
-            ys.append(c[1])
-        else:
-            for k in c:
-                walk(k)
-
-    walk(geometry["coordinates"])
+    g = shapely.make_valid(shape(geometry))
+    x0, y0, x1, y1 = g.bounds
+    # A map across the date line (Alaska's islands, Fiji) would get a box round
+    # the whole globe; it gets the box of its side with the most land instead.
+    if x1 - x0 > 180:
+        parts = [p for p in getattr(g, "geoms", [g]) if p.area > 0]
+        main = max(parts, key=lambda p: p.area)
+        east = main.centroid.x > 0
+        x0, y0, x1, y1 = shapely.union_all([p for p in parts if (p.centroid.x > 0) == east]).bounds
     return [
-        math.floor(min(xs) * 1e4) / 1e4,
-        math.floor(min(ys) * 1e4) / 1e4,
-        math.ceil(max(xs) * 1e4) / 1e4,
-        math.ceil(max(ys) * 1e4) / 1e4,
+        math.floor(x0 * 1e4) / 1e4,
+        math.floor(y0 * 1e4) / 1e4,
+        math.ceil(x1 * 1e4) / 1e4,
+        math.ceil(y1 * 1e4) / 1e4,
     ]
 
 
@@ -65,7 +70,7 @@ def main():
     kids = {}
     for i, f in regions.items():
         kids.setdefault(f["properties"].get("parent"), []).append(i)
-    with ThreadPoolExecutor(24) as pool:
+    with ThreadPoolExecutor(8) as pool:
         sizes = dict(zip(regions, pool.map(lambda i: size(regions[i]["properties"]["urls"]["pbf"]), regions)))
 
     def clean(i):
@@ -141,12 +146,17 @@ def main():
         r["neighbours"] = sorted(
             rows[j]["id"] for j in near if j != k and shapes[k].intersection(shapes[j]).area > 1e-7
         )
+    # A rough outline (to about 3 km) in the list itself, so the app can tell
+    # which map a place is in before any map is downloaded.
+    for r, g in zip(rows, shapes):
+        rough = shapely.set_precision(g.simplify(0.03, preserve_topology=True), 0.01)
+        r["area"] = shapely.geometry.mapping(rough)
     outlines = {r["id"]: regions[i]["geometry"] for r, i in zip(rows, picked)}
     with open("outlines.json", "w") as f:
         json.dump(outlines, f, separators=(",", ":"))
 
     rows.sort(key=lambda r: r["name"])
-    json.dump(rows, sys.stdout, ensure_ascii=False, indent=1)
+    json.dump(rows, sys.stdout, ensure_ascii=False, separators=(",", ":"))
     print()
 
 
